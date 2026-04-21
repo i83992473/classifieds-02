@@ -28,7 +28,7 @@ See `PRD.md` at the repo root for the full specification.
 | AWS S3 + CloudFront + Route 53 | Hosting + asset storage |
 | ACM (us-east-1) | TLS wildcard cert `*.mirabeltech.com` |
 
-**Deliberately not using:** MUI, Amplify, Cognito, any server-side PDF library, any backend. The `ReferenceCode/` folder has MUI + Amplify — **do not lift wholesale**; it's included only for proven block-model and ruler patterns (see "Key Files" below).
+**Deliberately not using:** MUI, Amplify, Cognito, any server-side PDF library, any backend.
 
 ---
 
@@ -122,7 +122,7 @@ Pre-signed PUT URLs go direct to S3. CloudFront fronts reads only. Do not try to
 Origin Access Control with SigV4. OAI is deprecated; never create new OAI resources.
 
 ### Per-tick `<div>` rulers
-Proven from `ReferenceCode/src/App.tsx:2157-2276`. Pixel-accurate, no SVG, no canvas, trivially styled with Tailwind. Don't switch to CSS gradient (tick spacing drifts on non-integer DPI).
+Each tick is a single absolutely-positioned `<div>`. Pixel-accurate, no SVG, no canvas, trivially styled with Tailwind. Don't switch to CSS gradient, repeating-background, or SVG (tick spacing drifts on non-integer devicePixelRatio and on zoom). See PRD §7 *AdCanvas + Rulers → Ruler implementation requirements* for the full spec: 20 px track, 4-level tick cadence (1" / 0.5" / 0.25" / 0.125"), integer-inch labels at 10 px, `Math.round(inches × 96)` for positions, excluded from `html2canvas` capture.
 
 ### Whole-block text formatting
 Each `TextBlock` has one `{ font, sizePt, bold, italic, underline, align, highlight }`. **No inline per-character formatting** in v1 — that would push us toward TipTap, which we've explicitly rejected for this use case.
@@ -141,21 +141,30 @@ Each `TextBlock` has one `{ font, sizePt, bold, italic, underline, align, highli
 - Show a toast on save failure with status code; don't auto-retry.
 - Never throw from a hook; return `{ ok: false, error }` instead so UI can surface it.
 
+### Environment variables
+`.env.example` at repo root is the committed contract; `.env.local` holds real values and is gitignored. Full spec: PRD §9.5. **Hard rule:** adding a `process.env.X` or `import.meta.env.VITE_X` read anywhere in the codebase requires adding the same key + comment + placeholder to `.env.example` in the same commit. `VITE_*` vars are inlined into the browser bundle (public — never put secrets there); unprefixed vars are Node/shell only. All browser-side env reads go through `src/lib/env.ts` (typed accessor, single audit point) — never read `import.meta.env` directly from component or hook code. Current secret inventory: `FIRECRAWL_API_KEY` only. AWS credentials live in the `classifieds-admin` CLI profile, not in env.
+
 ---
 
 ## Testing
 
-No test framework in v1 — manual smoke-test before each deploy per PRD §12 Phase 4. Add Vitest only if test coverage becomes a concrete concern.
+Three layers (full spec: PRD §11.5).
+
+1. **Unit (Vitest)** — pure functions in `src/lib/` and pure hooks in `src/editor/`. Run with `npm test`. Co-locate `*.test.ts` next to source. Fast (<1 s suite target). Network stubbed via `vi.fn()` at the `fetch` boundary.
+2. **Component (RTL + jsdom)** — stateful components: `AdCanvas` ruler tick count, `TextBlockView` formatting, `StatsRail` responsive collapse, `BlockList` reorder, `useShortcuts` dispatch. `html2canvas` and image decoding stubbed.
+3. **E2E (Firecrawl)** — agent-driven browser automation via the `firecrawl-interact` / `agent-browser` skills against `localhost:5173` and the deployed URL. Covers nine named flows (F-1 through F-9 in PRD §11.5). Manual sign-off on the same flows before any deploy. Prompts for each flow stored under `docs/e2e-prompts/F-*.md` so runs are reproducible. Firecrawl API key in `.env.local` (never committed).
+
+Coverage is not enforced, but aim for >70% line coverage on `src/lib/` and `src/editor/` by end of Phase 2.
 
 ---
 
 ## Validation (pre-deploy)
 
 ```bash
-npm run typecheck && npm run lint && npm run build
+npm run typecheck && npm run lint && npm test && npm run build
 ```
 
-Then smoke-test the built bundle against the local dev environment before syncing to S3.
+Then run the Firecrawl agent over flows F-1 through F-9 against the built bundle (served locally) before syncing to S3, and do a manual pass of the same flows on the real deploy target after CloudFront settles.
 
 ---
 
@@ -165,12 +174,7 @@ Then smoke-test the built bundle against the local dev environment before syncin
 |------|---------|
 | `PRD.md` | Authoritative product spec. Lock before changing. |
 | `CLAUDE.md` | This file. |
-| `ReferenceCode/src/App.tsx:181-200` | **Block type definitions** — lift shape, adapt field names |
-| `ReferenceCode/src/App.tsx:2157-2276` | **Ruler components** (Horizontal + Vertical) — lift verbatim, restyle with Tailwind |
-| `ReferenceCode/src/App.tsx:1412-1452` | **Raster PDF flow** — reference pattern for `html2canvas` + `jsPDF` at scale:3 |
 | `infra/setup.sh` | (planned) end-to-end AWS provisioning commands |
-
-**Do not** lift from ReferenceCode wholesale — it's a 4000-line admin dashboard with Amplify/MUI. Only the patterns above are relevant.
 
 ---
 

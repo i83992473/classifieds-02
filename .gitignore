@@ -6,10 +6,12 @@ dist/
 build/
 *.tsbuildinfo
 
-# Env
+# Env — never commit real values.
+# .env.example IS committed (the contract; see PRD §9.5) — hence the negation.
 .env
 .env.local
 .env.*.local
+!.env.example
 
 # Editor / OS
 .DS_Store

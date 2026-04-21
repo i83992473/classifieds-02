@@ -295,7 +295,7 @@ classifieds-02/
 
 **Clean-mode is a CSS class, not a route.** Toggling adds `.clean` to the root element; Tailwind variants (`.clean ~ [data-chrome]`, etc.) hide chrome. Zero render duplication.
 
-**Per-tick div rulers.** Proven pattern from the reference code. Pixel-accurate at any zoom, no SVG/canvas required, trivially stylable.
+**Per-tick div rulers.** Each tick is a single absolutely-positioned `<div>`. Pixel-accurate at any zoom, no SVG/canvas required, trivially stylable. (Deliberately chosen over CSS-gradient approaches, which drift on non-integer DPI.)
 
 **Writes bypass CloudFront.** CloudFront fronts reads only. S3 PUTs are direct via pre-signed URLs — avoids CF origin-request policy fiddling for SigV4 headers, standard AWS pattern.
 
@@ -307,10 +307,49 @@ classifieds-02/
 
 ### Feature: AdCanvas + Rulers
 **Purpose:** Render the ad's content area at fixed inch width with live ruler feedback.
-- Width driven by `widthInches` prop (from querystring, 96 px/in).
-- Horizontal ruler (top) shows ticks every 0.5" with full-inch labels.
-- Vertical ruler (left) shows the same, growing with content.
-- Canvas itself is just a `<div style={{ width: widthPx }}>` containing the `BlockList`.
+
+- Width driven by `widthInches` prop (from querystring, 96 px/in canonical).
+- Canvas itself is a `<div style={{ width: widthPx }}>` containing the `BlockList`.
+- Horizontal ruler along the top; vertical ruler along the left; small neutral square in the top-left corner where the two rulers meet.
+- Rulers and corner are hidden in Clean mode via the `.clean` root-class toggle.
+
+**Ruler implementation requirements**
+
+The rulers are built from individual absolutely-positioned `<div>` tick elements — one element per tick. Do **not** use SVG, `<canvas>`, CSS repeating-gradients, or CSS-background-image approaches (tick spacing drifts on fractional devicePixelRatio and breaks on zoom).
+
+*Geometry (canonical — 96 px/in)*
+- Ruler track thickness: **20 px** on both rulers.
+- Horizontal ruler width: `widthPx = widthInches × 96`, starting flush with the left edge of the canvas content (i.e., positioned `left: 20px` so tick `0"` aligns with the canvas origin, accounting for the vertical ruler's thickness).
+- Vertical ruler height: matches the current canvas content height dynamically (grows as blocks are added; uses `ResizeObserver` on the canvas element, not a fixed value).
+- Tick `0` on each ruler aligns exactly with the content-area origin (top-left corner of the first block's bounding box).
+
+*Tick cadence and sizes*
+- **Major tick** — every `1.0"`; length `12 px` perpendicular to the ruler; stroke `1 px`; color `#334155` (slate-700).
+- **Half tick** — every `0.5"` (skipping positions already occupied by a major tick); length `8 px`; stroke `1 px`; color `#64748b` (slate-500).
+- **Quarter tick** — every `0.25"` (skipping half/major positions); length `5 px`; stroke `1 px`; color `#94a3b8` (slate-400).
+- **Eighth tick** — every `0.125"` (skipping all above); length `3 px`; stroke `1 px`; color `#cbd5e1` (slate-300).
+
+*Labels*
+- Numeric label on every major tick, showing the inch number as an integer (`0`, `1`, `2`, …). No units suffix — the ruler context makes it clear.
+- Font: `10px`, system-ui or the editor's sans default; color `#334155`; weight 500.
+- Horizontal ruler: label sits **above** the tick, horizontally centered on the tick (or left-edge-aligned for the `0` label so it doesn't overhang negatively).
+- Vertical ruler: label is rotated `-90deg` and sits to the **left** of the tick, vertically centered.
+- The `0` label is always rendered; at very narrow widths (<1") it may be the only label.
+
+*Backgrounds and borders*
+- Ruler track background: `#f8fafc` (slate-50).
+- Inner edge (the side touching the canvas) has a `1px solid #e2e8f0` (slate-200) separator.
+- Top-left corner square (`20 × 20 px`): same background as the tracks, same inner border.
+
+*Precision & sub-pixel handling*
+- Tick positions computed as `Math.round(inchOffset × 96)` in JS before applying to `style.left` / `style.top` — never relying on fractional CSS calc to produce pixel-accurate ticks.
+- Every tick is a real DOM element; the tick list is memoized on `widthInches` (horizontal) and `heightPx` (vertical) so React doesn't re-render ticks unnecessarily.
+- The canvas content must **never** shift by a fractional pixel as height changes (the integer-rounding above prevents the common "rulers shimmer as the canvas grows" bug).
+
+*Behavior*
+- When a block is added, removed, resized (textarea auto-grow, image swap), or reordered, the vertical ruler extends/contracts to match the canvas's new `offsetHeight` on the next animation frame.
+- Rulers are purely visual — they are not interactive in v1 (no click-to-add-guide, no drag, no zoom). Ignore pointer events.
+- Rulers are **excluded from the raster capture** — `html2canvas` targets the content `<div>`, not the wrapper that contains the rulers. Confirm this by inspecting any generated PDF: no tick marks should ever appear in the saved output.
 
 ### Feature: TextBlock
 **Purpose:** Whole-block text content with typographic controls.
@@ -397,12 +436,12 @@ classifieds-02/
 ### Frontend
 | Component | Choice | Version | Justification |
 |---|---|---|---|
-| Framework | React | ^18.3 | Industry standard, reference code already React, maximum AI-assistance coverage |
+| Framework | React | ^18.3 | Industry standard, maximum AI-assistance coverage |
 | Language | TypeScript | ^5.4 | Type safety for Block union types and launch params |
 | Build tool | Vite | ^5.2 | Fast dev loop, simple static bundle for S3 |
 | Styling | Tailwind CSS | ^3.4 | User preference; fits Clean-mode CSS-class toggle |
-| PDF (raster) | jsPDF | ^2.5 | Industry-standard, proven in reference code |
-| DOM → canvas | html2canvas | ^1.4 | Pairs with jsPDF, reference-proven |
+| PDF (raster) | jsPDF | ^2.5 | Industry-standard client-side PDF |
+| DOM → canvas | html2canvas | ^1.4 | Pairs with jsPDF; renders the live DOM at `scale: 3` |
 | Drag-drop | @dnd-kit/core + @dnd-kit/sortable | ^6.1 | Accessible, touch-safe, vertical list use case |
 | S3 uploads | Native `fetch` PUT | n/a | Pre-signed URL is an HTTPS endpoint; no SDK needed |
 
@@ -422,11 +461,12 @@ classifieds-02/
 ### Dev dependencies
 - ESLint + `@typescript-eslint/*` with a minimal rule set
 - Prettier (defaults)
-- No unit test framework in v1 — manual smoke test during deploy
+- **Vitest** + **@testing-library/react** + **@testing-library/jest-dom** + **jsdom** — unit/component tests for pure functions and hooks (see §11.5)
+- **Firecrawl** (https://www.firecrawl.dev/app) — agent-driven browser automation for end-to-end smoke tests against localhost and the deployed URL (see §11.5). Configured via the `firecrawl-interact` / `agent-browser` skills; API key lives in `.env.local` (never committed).
 
 ### Optional (punt unless needed)
-- Vitest (if test coverage becomes a concern)
-- Sentry (if production error visibility becomes a concern)
+- **Playwright** — only if Firecrawl-driven E2E becomes insufficient (e.g., we need deterministic CI replay of the same flow)
+- **Sentry** — if production error visibility becomes a concern
 
 ---
 
@@ -449,6 +489,60 @@ The editor is **unauthenticated as a standalone app**. Trust flows entirely from
 | `public/config.json` (fetched at load) | `{ assetsOrigin: "https://editor-assets.mirabeltech.com", defaultWidthInches: 3.25 }` — keeps build env-agnostic |
 | Querystring (per session) | `width`, `adId`, `adName`, `sectionId`, `sectionName`, `positionId`, `positionName`, `sortOrder`, `token`, `callbackUrl` |
 | `localStorage` (per browser) | `statsRailOpen: boolean` |
+| Env vars (build/test/deploy-time) | See §9.5 |
+
+### 9.5 Environment variables & secrets
+
+Env vars are **not a runtime configuration channel for the deployed client** (the browser bundle reads from `/public/config.json` at load — see Configuration table above). They are used only by: the dev server, the test runner, the Firecrawl agent, and the deploy scripts. This section exists so coding agents and new contributors don't get tripped up on missing values during implementation or testing.
+
+**Three tiers**
+
+| Tier | File / location | Committed? | Consumed by |
+|---|---|---|---|
+| Contract / example | `.env.example` (repo root) | ✅ yes | humans and agents discovering what vars exist |
+| Developer local | `.env.local` (repo root) | ❌ gitignored | `vite`, `vitest`, deploy scripts, Firecrawl agent |
+| Production | AWS Parameter Store / CloudFront Functions env / AWS console | ❌ never in git | deployed stack (post-Phase-4 infra) |
+
+**`.env.example` is the contract.** Every env var that any code path reads must be listed in `.env.example`, with:
+- A block comment describing what it is and which tier consumes it (build, dev, test, deploy).
+- A placeholder value — the real value if it's non-secret (e.g., `AWS_PROFILE=classifieds-admin`), empty string if it's a secret.
+- A link to where a real value can be obtained (e.g., Firecrawl dashboard, AWS console path).
+
+**Rule (hard requirement for coding agents):** adding a `process.env.X` or `import.meta.env.VITE_X` read anywhere in the codebase **requires** adding the same key to `.env.example` in the same commit. Missing entries cause silent `undefined` failures during setup and waste hours of debugging time.
+
+**Naming convention**
+- `VITE_*` prefix — any variable that must be readable from the browser bundle. Vite inlines these at build time, so treat them as **public** — never put a secret behind a `VITE_` name.
+- **No prefix** — Node-only / shell / test-runner / deploy-script vars. These never reach the browser bundle.
+
+**Secrets policy**
+- Secrets live **only** in `.env.local` (developer machines) or in AWS (production). Never committed, never baked into the client bundle, never logged.
+- Current secret inventory: `FIRECRAWL_API_KEY`. The editor itself carries no AWS credentials (see §9 Authentication).
+- AWS credentials are read from the CLI profile `classifieds-admin` in `~/.aws/credentials` — never from env vars in this project.
+
+**Typed access (implementation guidance)**
+- Add a thin `src/lib/env.ts` module that wraps `import.meta.env.VITE_*` reads, provides a typed accessor per var, and returns a sensible default. Component / hook code imports from `src/lib/env.ts`, not from `import.meta.env` directly. This keeps the set of env-var reads auditable from one file.
+- For Node-side reads (deploy scripts, test helpers), do the same in `infra/lib/env.ts` or similar. Single read site per process boundary.
+
+**Workflow — adding a new env var**
+1. Add the key, comment, and placeholder to `.env.example`.
+2. Add a typed accessor in `src/lib/env.ts` (or the Node equivalent).
+3. Reference the accessor from the code that needs the value.
+4. Commit `.env.example`, the accessor, and the consuming code together.
+5. Update your own `.env.local` with a real value locally.
+6. If the var is needed in production (post-Phase-4), document where it lives in AWS (Parameter Store path, CloudFront env, etc.) in `infra/setup.sh` as a comment.
+
+**Initial inventory (baseline `.env.example`, expected at project root from Phase 1)**
+
+| Variable | Tier | Secret? | Purpose |
+|---|---|---|---|
+| `FIRECRAWL_API_KEY` | test | ✅ yes | Firecrawl agent auth for E2E flows (§11.5). Obtain at https://www.firecrawl.dev/app |
+| `VITE_ASSETS_ORIGIN` | build (dev override) | no | Optional override for the assets CDN origin during dev; production reads this from `/public/config.json` instead |
+| `VITE_DEV_MAIN_APP_ORIGIN` | dev/test | no | URL of the local stub serving `/sign-upload` and acting as `callbackUrl` target during Phase 3 |
+| `EDITOR_DIST_ID` | deploy | no (but sensitive) | CloudFront distribution ID for the editor app; used by the invalidation step in Phase 4 |
+| `ASSETS_DIST_ID` | deploy | no (but sensitive) | CloudFront distribution ID for the assets bucket |
+| `AWS_PROFILE` | deploy | no | Fixed value `classifieds-admin`; exported for convenience so deploy scripts don't need `--profile` on every line |
+
+Agents scaffolding or modifying the project must treat this table and `.env.example` as the source of truth. If a required var is missing locally, fail fast with a clear error that names the key and points at `.env.example` — do not silently fall back to a stub value that can leak into a deployed build.
 
 ### Security in scope
 
@@ -654,6 +748,59 @@ The editor is "done" when a user can be opened into `editor.mirabeltech.com` wit
 - View-switch keystroke (`Ctrl+2`) swaps in <50 ms (just a CSS class)
 - Popup doesn't auto-close on save — user decides when to leave
 
+### 11.5 Testing strategy
+
+Three complementary layers. Each layer is expected to run green before the corresponding phase is marked done in §12.
+
+**Layer 1 — Unit tests (Vitest)**
+
+Targets pure, deterministic code — no DOM, no network. Fast (<1 s whole suite in v1). Run with `npm test`.
+
+- `src/lib/units.ts` — inches ↔ px ↔ pt conversions. Boundary cases: 0, fractional (0.125"), negative, very large.
+- `src/lib/querystring.ts` — param parsing, type coercion, default-width fallback, malformed inputs (non-numeric `width`, missing `adId`, invalid `callbackUrl` URL).
+- `src/lib/fonts.ts` — curated-list lookup, fallback when a block's `font` isn't in the list.
+- `src/lib/pdf.ts` — page-size math (`[widthInches, heightInches]`), JPEG-vs-PNG branching based on presence of `ImageBlock`.
+- `src/editor/useAdStats.ts` — called as a pure function with fixture `Block[]` arrays; asserts all 7 stats and both warning types (low-DPI image, empty text block).
+- `src/editor/useUndoableState.ts` — snapshot triggers fire on add/delete/reorder/image-swap/format-change only; history capped at 50; redo cleared on new snapshot after undo.
+- Block-model factories (`blocks.ts`) — new block defaults, id uniqueness.
+
+**Layer 2 — Component tests (React Testing Library + jsdom)**
+
+Targets stateful components where rendered output matters. Not a substitute for a real browser — `html2canvas` and image decoding are stubbed.
+
+- `AdCanvas` — renders correct tick count at several widths (3.25", 5", 10"); rulers hidden when `.clean` class applied at root.
+- `TextBlockView` — typing updates state; formatting toolbar appears on focus; toolbar actions toggle the right `{bold, italic, …}` fields.
+- `StatsRail` — collapses below 1100px, chips render with correct values; warnings badge appears when a warning exists.
+- `BlockList` — up/down buttons disabled at list ends; drag-reorder callback fires with correct indices.
+- `useShortcuts` — Ctrl+1/2/./S dispatch the right actions; doesn't fire when focused in a textarea (Ctrl+S is the one exception).
+
+**Layer 3 — End-to-end smoke tests (Firecrawl + manual)**
+
+Two modes:
+
+1. **Agent-driven (Firecrawl `/interact`)** — a Claude subagent using the `firecrawl-interact` / `agent-browser` skill navigates a running instance, performs the flows below, and asserts outcomes (DOM state, S3 object existence, callback POST receipt). Runs against `localhost:5173` during development and against `https://editor.mirabeltech.com` after deploy. This replaces what would otherwise be Playwright in v1.
+
+2. **Manual checklist** — the same flows, run by hand before any deploy, to catch anything the agent misses (visual regressions, font rendering, popup sizing on a real monitor).
+
+**E2E flows (both modes cover these):**
+
+- **F-1 Cold open, blank ad** — launch with fresh `adId`; blank canvas renders; rulers + stats rail present; title bar shows `adName`.
+- **F-2 Cold open, restore from ad.json** — launch with an `adId` that has an existing `ad.json` in S3; all blocks, widths, and formatting restore.
+- **F-3 Text-only ad round-trip** — add 2 text blocks, format one bold + 14 pt, save; verify `ad.json`, `pdf.pdf`, `thumbnail.jpg` land in S3; verify callback POST received with matching stats.
+- **F-4 Ad with image** — drop a real JPEG into the canvas; wait for upload; save; verify PDF contains the image and thumbnail is non-empty.
+- **F-5 Low-DPI warning** — drop a 200 px image into a 3.25" ad; red dot appears on the block; warning appears in rail; save still succeeds (warnings are advisory).
+- **F-6 Clean-mode toggle** — Ctrl+2; rulers, toolbars, drag handles, warning dots all disappear; content remains pixel-identical. Ctrl+1 restores.
+- **F-7 Undo/redo** — add, format, reorder, delete blocks; Ctrl+Z reverses structural ops; Ctrl+Shift+Z redoes; textarea keystrokes use native textarea undo (not the structural history).
+- **F-8 Responsive rail** — resize popup across 1100 px; rail collapses to chips + warnings badge and re-expands correctly.
+- **F-9 Reload restores** — complete F-3, close popup, reopen at same URL; ad restores exactly.
+
+**Conventions**
+- Test files co-located as `*.test.ts` / `*.test.tsx` next to the source.
+- Fixtures for `Block[]` arrays in `src/test/fixtures.ts`.
+- Network calls stubbed via `vi.fn()` at the `fetch` boundary; no MSW unless Layer-2 tests start to need it.
+- Agent-driven E2E expected to be written *after* each phase's features land, then re-run on every subsequent phase to catch regressions. Store the prompts used as `docs/e2e-prompts/F-*.md` so the same flow can be re-run identically.
+- Coverage is not enforced in v1, but Vitest's `--coverage` flag should produce >70% line coverage for `src/lib/` and `src/editor/` at the end of Phase 2.
+
 ---
 
 ## 12. Implementation Phases
@@ -675,9 +822,11 @@ The editor is "done" when a user can be opened into `editor.mirabeltech.com` wit
 - ✅ Drop/paste/picker with local `URL.createObjectURL` (no S3 yet)
 - ✅ Reorder: drag handle (`@dnd-kit`) + up/down buttons
 - ✅ Structural undo/redo (`useUndoableState`)
+- ✅ Vitest + RTL configured; Layer-1 tests written for `units`, `querystring`, `blocks`, `useUndoableState`; Layer-2 tests for `AdCanvas` tick counts and `TextBlockView` formatting toggles
 
 **Validation**
-- Open `localhost:5173?width=3.25&adId=test`, build a three-block ad, undo, redo, reorder, format-change. All works. No cloud dependency.
+- Manual: open `localhost:5173?width=3.25&adId=test`, build a three-block ad, undo, redo, reorder, format-change. All works. No cloud dependency.
+- Automated: `npm test` passes; Firecrawl-agent runs flows F-1 and F-7 against `localhost:5173`.
 
 ### Phase 2: Stats + UI Polish (~2 days)
 
@@ -691,9 +840,11 @@ The editor is "done" when a user can be opened into `editor.mirabeltech.com` wit
 - ✅ `Ctrl+.` stats toggle, `Ctrl+S` save stub
 - ✅ localStorage persistence for rail state
 - ✅ Header shows `adName` + `sectionName` · `positionName`
+- ✅ Layer-1 tests for `useAdStats` covering all 7 stats and both warning types; Layer-2 tests for `StatsRail` responsive collapse and warning badge
 
 **Validation**
-- Resize window across 1100px breakpoint; rail collapses and re-expands correctly. Drop a low-res image; red dot + rail warning appear. Press `Ctrl+2`; chrome vanishes. Stats update while typing without lag.
+- Manual: resize window across 1100 px breakpoint; rail collapses and re-expands correctly. Drop a low-res image; red dot + rail warning appear. Press `Ctrl+2`; chrome vanishes. Stats update while typing without lag.
+- Automated: `npm test` ≥70% line coverage on `src/lib/` and `src/editor/`; Firecrawl-agent runs flows F-5, F-6, F-8 against `localhost:5173`.
 
 ### Phase 3: PDF + Cloud Wiring (~3–4 days)
 
@@ -708,9 +859,11 @@ The editor is "done" when a user can be opened into `editor.mirabeltech.com` wit
 - ✅ Load-from-S3 on mount: `GET ad.json`, restore state
 - ✅ Image drop now uploads to S3 via signed URL (replacing local blob URL)
 - ✅ Stub main-app endpoints (local mock) so end-to-end works against a fake
+- ✅ Layer-1 tests for `lib/pdf.ts` page-size math and `lib/s3.ts` URL-signing request shape; fetch stubbed for `lib/api.ts` happy-path + error cases
 
 **Validation**
-- Stub main app responds to `/sign-upload` with valid URLs pointing at a dev S3 bucket; save produces a PDF, thumbnail, and ad.json in the bucket; callbackUrl POST returns 200; browser shows "Saved." Reload the page with same adId → state restores from ad.json.
+- Manual: stub main app responds to `/sign-upload` with valid URLs pointing at a dev S3 bucket; save produces a PDF, thumbnail, and ad.json in the bucket; callbackUrl POST returns 200; browser shows "Saved." Reload the page with same adId → state restores from ad.json.
+- Automated: Firecrawl-agent runs flows F-2, F-3, F-4, F-9 against `localhost:5173` pointed at the dev bucket; agent verifies S3 object existence and callback receipt via the stub's inspection endpoint.
 
 ### Phase 4: AWS Infra + Deploy (~2 days)
 
@@ -724,9 +877,11 @@ The editor is "done" when a user can be opened into `editor.mirabeltech.com` wit
 - ✅ CORS config on assets bucket (editor origin + localhost:5173)
 - ✅ Deploy script: `aws s3 sync dist/ s3://classifieds-ad-editor --delete --cache-control "public,max-age=31536000,immutable" --exclude index.html` + `aws s3 cp dist/index.html s3://classifieds-ad-editor/index.html --cache-control "no-cache,no-store,must-revalidate"` + `aws cloudfront create-invalidation --distribution-id <EDITOR_DIST> --paths /index.html /`
 - ✅ First end-to-end smoke test against real main-app `/sign-upload` endpoint (once main-app team delivers it)
+- ✅ Full F-1 through F-9 E2E checklist run by the Firecrawl agent against `https://editor.mirabeltech.com` and by hand as a final manual sign-off
 
 **Validation**
-- Navigate `https://editor.mirabeltech.com/?width=3.25&adId=smoketest-1&token=<real>&callbackUrl=<real>`; full save flow produces files in S3 and a successful callback POST; reloading the URL restores the ad.
+- Manual: navigate `https://editor.mirabeltech.com/?width=3.25&adId=smoketest-1&token=<real>&callbackUrl=<real>`; full save flow produces files in S3 and a successful callback POST; reloading the URL restores the ad.
+- Automated: Firecrawl-agent completes all nine F-* flows green against the deployed URL.
 
 ---
 
@@ -783,7 +938,6 @@ When selectable/searchable text or server-side re-rendering is required, introdu
 ## 15. Appendix
 
 ### Related documents
-- `ReferenceCode/src/App.tsx` — working prior implementation; lift patterns from lines 181–200 (block types), 2157–2276 (rulers), 1412–1452 (raster PDF flow). Do **not** lift wholesale — it includes a full admin dashboard we don't need.
 - Memory: `C:\Users\Ian\.claude\projects\C--Projects-AICodeAssistants-Classified-02\memory\project_classified_editor_v1.md` — architecture decisions and rationale.
 
 ### Key external dependencies
@@ -795,6 +949,9 @@ When selectable/searchable text or server-side re-rendering is required, introdu
 - dnd-kit — https://dndkit.com
 - AWS CloudFront OAC — https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-restricting-access-to-s3.html
 - ACM region requirement — https://docs.aws.amazon.com/acm/latest/userguide/acm-regions.html
+- Firecrawl — https://www.firecrawl.dev/app (agent-driven browser automation used for E2E smoke tests; see §11.5)
+- Vitest — https://vitest.dev
+- React Testing Library — https://testing-library.com/docs/react-testing-library/intro/
 
 ### AWS resources (planned)
 | Resource | Name/ID |
