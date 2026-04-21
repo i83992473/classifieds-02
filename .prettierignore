@@ -1,0 +1,14 @@
+node_modules
+dist
+build
+coverage
+package-lock.json
+
+# User-authored docs — do not reformat.
+CLAUDE.md
+PRD.md
+.agents
+.claude
+
+# Shared claude-config — managed elsewhere.
+.claude/settings.local.json
