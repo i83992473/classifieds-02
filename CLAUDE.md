@@ -89,9 +89,9 @@ classifieds-02/
 Single-page app. Popup window lifecycle:
 
 ```
-Main app → window.open("editor.mirabeltech.com/?adId=…&token=…&callbackUrl=…")
+Main app → window.open("editor.mirabeltech.com/?tenantId=…&adId=…&token=…&callbackUrl=…")
   ↓
-Editor mounts → parses querystring → fetches editor-assets.mirabeltech.com/public/ads/{adId}/ad.json
+Editor mounts → parses querystring → fetches editor-assets.mirabeltech.com/public/tenants/{tenantId}/ads/{adId}/ad.json
   ↓
 User edits. On image drop: POST /sign-upload → receive pre-signed URL → PUT direct to S3.
   ↓
@@ -105,6 +105,17 @@ Two S3 buckets, two CloudFront distributions, one wildcard cert. Writes bypass C
 ---
 
 ## Code Patterns
+
+### Multi-tenancy: server-built S3 keys, JWT-claim authority
+The editor is multi-tenant. Full spec: PRD §16. The rules that matter for code:
+
+- **Every S3 key starts with `public/tenants/{tenantId}/ads/{adId}/...`** Hard-coded in tests as fixtures only; never as a literal in production code.
+- **The editor never sends a full S3 key to `/sign-upload`.** It sends `{ name, contentType, contentLength }` per file (e.g., `name: "pdf.pdf"`, `name: "images/img-abc123.jpg"`). The main app builds the full key server-side from the verified JWT-claim `tenantId`. Client-side prefix construction is the canonical multi-tenant data-leak bug — do not reintroduce it.
+- **The editor treats the Bearer token as opaque.** It never parses the JWT. Trust the main app to validate the claim on every API call.
+- **`tenantId` is a guessable slug** (`acme`, `bigpub`); the unguessable `adId` carries path-secrecy on reads. The cryptographic boundary lives in the JWT claim, not the slug.
+- **Required launch params:** `tenantId`, `tenantName`, `adId`, `token`, `callbackUrl`. Missing any of these → render a hard error page; do **not** mount the edit surface. (`width` remains optional with a 3.25" default — unlike the other params, a missing width is recoverable.)
+- **Branding/whitelabel is v2.** Don't add per-tenant config endpoints or theming hooks until that lands. `tenantName` in the header is the only tenant-visible surface in v1.
+- **`callbackUrl` validation lives on the main app**, not the editor (PRD §16.5). The editor forwards the URL it was launched with.
 
 ### Block-JSON is the single source of truth
 Every surface — editor preview, raster capture, stats, persisted ad.json, callback payload — reads from the same `Block[]` array. No adapters. No secondary representations. The JSON is versioned (`{ version: 1, widthInches, blocks: [] }`).
@@ -199,11 +210,13 @@ Then run the Firecrawl agent over flows F-1 through F-9 against the built bundle
 Two endpoints on the parent main app (see PRD §10):
 
 1. **`POST /api/classifieds/sign-upload`** (new — main-app team to build)
-   - Validates Bearer token + caller owns `adId`
-   - Returns pre-signed PUT URLs scoped to `public/ads/{adId}/...` with 15-min expiry
+   - Validates Bearer token, extracts verified `tenantId` claim, validates `(tenantId, adId)` ownership
+   - **Constructs full S3 keys server-side** as `public/tenants/{tenantId}/ads/{adId}/{file.name}` — client sends only `name`, never a full key
+   - Validates `callbackUrl.host` is on the tenant's registered allowlist (rejects cross-tenant exfil)
+   - Returns pre-signed PUT URLs with 15-min expiry, paired with the server-built `key`
 
 2. **`POST {callbackUrl}`** (URL provided in querystring)
-   - Final save notification with metadata + stats snapshot
+   - Final save notification with metadata + stats snapshot; payload includes `tenantId` echo
 
 Both require CORS allow-origin for `https://editor.mirabeltech.com` and `http://localhost:5173`.
 

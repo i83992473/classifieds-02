@@ -12,7 +12,7 @@ The **Classified-02 Ad Editor** is a standalone, single-purpose web application 
 
 The product deliberately trades vector-PDF fidelity for operational simplicity: in v1 the PDF is generated client-side via `html2canvas` + `jsPDF`, eliminating the need for any backend infrastructure beyond two S3 buckets and two CloudFront distributions. At `scale: 3` the raster output clears the 200 DPI newspaper print specification comfortably, and the entire architecture can be built, deployed, and operated by a single developer at under $5/month of AWS spend.
 
-**MVP goal:** Enable a user opened into `editor.mirabeltech.com?adId=…&token=…&callbackUrl=…` to produce, save, and round-trip a print-quality classified ad with text, formatting, and images — all without authentication beyond the short-lived Bearer token issued by the main app.
+**MVP goal:** Enable a user opened into `editor.mirabeltech.com?tenantId=…&adId=…&token=…&callbackUrl=…` to produce, save, and round-trip a print-quality classified ad with text, formatting, and images — all without authentication beyond the short-lived Bearer token issued by the main app. The editor is **multi-tenant**: the same bundle serves all tenants, and isolation is enforced at the `/sign-upload` API on the main app (see §16).
 
 ---
 
@@ -206,6 +206,7 @@ Publishing-industry users (newspaper, magazine, directory) who place and produce
 │                     React + Vite + Tailwind                             │
 │                                                                         │
 │  2. GET ad.json  ──────────────────►  editor-assets.mirabeltech.com     │
+│     /public/tenants/{tenantId}/ads/{adId}/ad.json                       │
 │                                       (CloudFront → S3 READ)            │
 │                                                                         │
 │  3. On drop/save:                                                       │
@@ -215,18 +216,19 @@ Publishing-industry users (newspaper, magazine, directory) who place and produce
 │  4. POST callbackUrl ──► main app  { metadata + stats }                 │
 └─────────────────────────────────────────────────────────────────────────┘
 
-            S3 us-east-1                         CloudFront + OAC
-            ┌──────────────────────┐             ┌──────────────────┐
-            │ classifieds-ad-editor│  ◄─── OAC ──│ editor.*         │
-            └──────────────────────┘             └──────────────────┘
-            ┌──────────────────────┐             ┌──────────────────┐
-            │ classifieds-ad-assets│  ◄─── OAC ──│ editor-assets.*  │(reads)
-            │  public/ads/{adId}/  │             └──────────────────┘
-            │    ad.json           │
-            │    pdf.pdf           │  ◄── direct PUT (pre-signed URLs) ──
-            │    thumbnail.jpg     │
-            │    images/*.jpg      │
-            └──────────────────────┘
+            S3 us-east-1                                  CloudFront + OAC
+            ┌─────────────────────────────────────┐       ┌──────────────────┐
+            │ classifieds-ad-editor               │  OAC ─│ editor.*         │
+            └─────────────────────────────────────┘       └──────────────────┘
+            ┌─────────────────────────────────────┐       ┌──────────────────┐
+            │ classifieds-ad-assets               │  OAC ─│ editor-assets.*  │ (reads)
+            │  public/tenants/{tenantId}/         │       └──────────────────┘
+            │    ads/{adId}/                      │
+            │      ad.json                        │
+            │      pdf.pdf                        │  ◄── direct PUT (pre-signed URLs) ──
+            │      thumbnail.jpg                  │
+            │      images/*.jpg                   │
+            └─────────────────────────────────────┘
 ```
 
 ### Directory structure (target)
@@ -487,7 +489,7 @@ The editor is **unauthenticated as a standalone app**. Trust flows entirely from
 | Location | Contents |
 |---|---|
 | `public/config.json` (fetched at load) | `{ assetsOrigin: "https://editor-assets.mirabeltech.com", defaultWidthInches: 3.25 }` — keeps build env-agnostic |
-| Querystring (per session) | `width`, `adId`, `adName`, `sectionId`, `sectionName`, `positionId`, `positionName`, `sortOrder`, `token`, `callbackUrl` |
+| Querystring (per session) | `tenantId`, `tenantName`, `width`, `adId`, `adName`, `sectionId`, `sectionName`, `positionId`, `positionName`, `sortOrder`, `token`, `callbackUrl` |
 | `localStorage` (per browser) | `statsRailOpen: boolean` |
 | Env vars (build/test/deploy-time) | See §9.5 |
 
@@ -582,34 +584,40 @@ Agents scaffolding or modifying the project must treat this table and `.env.exam
 
 | Name | Type | Required | Notes |
 |---|---|---|---|
+| `tenantId` | string (slug) | Yes | Tenant identifier — human-readable slug (`acme`, `bigpub`). Used to build the S3 key prefix and as a fallback header label. **Never trusted for authorization** — main app validates it against the JWT claim. Missing/unknown → editor renders a hard error page (no edit surface). See §16. |
+| `tenantName` | string | Yes | Tenant's display name shown in the editor header (e.g., "Acme Publishing"). Display-only; never used for routing or storage. |
 | `width` | number (in) | No | Default 3.25 if missing/invalid |
-| `adId` | string | Yes | Stable ID, used for S3 path and signed-upload scope |
+| `adId` | string | Yes | Stable ID, used for S3 path and signed-upload scope. Unique **within a tenant**, not globally — `(tenantId, adId)` is the composite key. Treated as unguessable. |
 | `adName` | string | No | Displayed in header |
 | `sectionId` | string | No | Echoed back in save payload |
 | `sectionName` | string | No | Displayed in header subtitle |
 | `positionId` | string | No | Echoed back |
 | `positionName` | string | No | Displayed in header subtitle |
 | `sortOrder` | number | No | Echoed back |
-| `token` | string | Yes | Short-lived Bearer, ≤30min expiry |
-| `callbackUrl` | string (URL) | Yes | HTTPS endpoint on main app for final metadata POST |
+| `token` | string | Yes | Short-lived Bearer, ≤30min expiry. **Must carry a verified `tenantId` claim** in v1 multi-tenant build (see §16). |
+| `callbackUrl` | string (URL) | Yes | HTTPS endpoint on main app for final metadata POST. Host **must** appear on the tenant's registered allowlist; main app rejects mismatches at `/sign-upload` time (see §16). |
 
 ### 10.2 Editor → Main App: `/sign-upload` (NEW — to be built on main app)
 
 **Purpose:** Validate caller's Bearer token + `adId` ownership; return pre-signed S3 PUT URLs.
 
 **Request**
+
+Note: in the multi-tenant model (see §16), the **client never specifies the S3 key prefix**. The editor sends only logical `files[]` descriptors (filename + content-type + length); the main app constructs each full key server-side from the verified `tenantId` claim in the Bearer token. This is the load-bearing rule that prevents cross-tenant write leaks.
+
 ```http
 POST <main app>/api/classifieds/sign-upload
-Authorization: Bearer <token>
+Authorization: Bearer <token>     ← carries verified tenantId claim
 Content-Type: application/json
 
 {
   "adId": "42",
+  "callbackUrl": "https://main.acmeclassifieds.com/api/ads/42/callback",
   "files": [
-    { "key": "public/ads/42/pdf.pdf",      "contentType": "application/pdf", "contentLength": 1258004 },
-    { "key": "public/ads/42/thumbnail.jpg","contentType": "image/jpeg",     "contentLength": 28119 },
-    { "key": "public/ads/42/ad.json",     "contentType": "application/json","contentLength": 4812 },
-    { "key": "public/ads/42/images/img-abc123.jpg", "contentType": "image/jpeg", "contentLength": 485112 }
+    { "name": "pdf.pdf",                   "contentType": "application/pdf",  "contentLength": 1258004 },
+    { "name": "thumbnail.jpg",             "contentType": "image/jpeg",       "contentLength": 28119 },
+    { "name": "ad.json",                   "contentType": "application/json", "contentLength": 4812 },
+    { "name": "images/img-abc123.jpg",     "contentType": "image/jpeg",       "contentLength": 485112 }
   ]
 }
 ```
@@ -619,26 +627,29 @@ Content-Type: application/json
 {
   "expiresInSeconds": 900,
   "urls": [
-    { "key": "public/ads/42/pdf.pdf",       "uploadUrl": "https://classifieds-ad-assets.s3.amazonaws.com/public/ads/42/pdf.pdf?X-Amz-Algorithm=AWS4-HMAC-SHA256&…" },
-    { "key": "public/ads/42/thumbnail.jpg", "uploadUrl": "…" },
-    { "key": "public/ads/42/ad.json",      "uploadUrl": "…" },
-    { "key": "public/ads/42/images/img-abc123.jpg", "uploadUrl": "…" }
+    { "key": "public/tenants/acme/ads/42/pdf.pdf",                   "uploadUrl": "https://classifieds-ad-assets.s3.amazonaws.com/public/tenants/acme/ads/42/pdf.pdf?X-Amz-Algorithm=AWS4-HMAC-SHA256&…" },
+    { "key": "public/tenants/acme/ads/42/thumbnail.jpg",             "uploadUrl": "…" },
+    { "key": "public/tenants/acme/ads/42/ad.json",                   "uploadUrl": "…" },
+    { "key": "public/tenants/acme/ads/42/images/img-abc123.jpg",     "uploadUrl": "…" }
   ]
 }
 ```
 
 **Main app responsibilities**
 - Validate Bearer token signature and expiry.
-- Validate caller owns `adId` (via main app's own authorization rules).
-- Validate each `key` begins with `public/ads/{adId}/` (reject keys outside the ad's folder).
+- Extract `tenantId` from the verified token claim (do NOT trust any client-supplied tenantId).
+- Validate caller owns `(tenantId, adId)` via main app's own authorization rules.
+- Construct each full S3 key as `public/tenants/{tenantId}/ads/{adId}/{file.name}` from the verified claim — the client supplies `name` only.
+- Reject any `file.name` containing `..`, leading `/`, or path-traversal segments.
+- Validate `callbackUrl.host` is on the tenant's registered callback-host allowlist; reject otherwise (prevents tenant A from launching the editor with tenant B's exfil endpoint).
 - Validate `contentType` matches expected set (`application/pdf`, `image/jpeg`, `image/png`, `application/json`).
 - Optionally clamp `contentLength` to a reasonable max (e.g., 25 MB per file).
 - Use AWS SDK `getSignedUrl(PutObjectCommand, { expiresIn: 900 })` against the `classifieds-ad-assets` bucket.
-- Return the signed URLs.
+- Return the signed URLs (each paired with the server-built `key` so the client can verify).
 
 **Errors**
 - `401 Unauthorized` — token invalid or expired
-- `403 Forbidden` — caller does not own this adId, OR key outside folder scope
+- `403 Forbidden` — caller does not own this `(tenantId, adId)`, OR `callbackUrl` host not on tenant's allowlist, OR `file.name` rejected for path-traversal
 - `413 Payload Too Large` — file exceeds max size
 - `415 Unsupported Media Type` — contentType not in allowed list
 
@@ -671,6 +682,7 @@ Authorization: Bearer <token>
 Content-Type: application/json
 
 {
+  "tenantId": "acme",
   "adId": "42",
   "adName": "ESTATE SALE - 123 Oak St.",
   "widthInches": 3.25,
@@ -679,12 +691,12 @@ Content-Type: application/json
   "positionId": "p-frontpage",
   "positionName": "Front Page",
   "sortOrder": 5,
-  "pdfKey": "public/ads/42/pdf.pdf",
-  "thumbnailKey": "public/ads/42/thumbnail.jpg",
+  "pdfKey": "public/tenants/acme/ads/42/pdf.pdf",
+  "thumbnailKey": "public/tenants/acme/ads/42/thumbnail.jpg",
   "blocks": [
     { "id": "b1", "type": "text", "text": "ESTATE SALE", "font": "Oswald", "sizePt": 18, "bold": true, "italic": false, "underline": false, "align": "center", "highlight": null },
     { "id": "b2", "type": "text", "text": "Sat 9-3, 123 Oak St.\nTools, furniture, art.", "font": "Merriweather", "sizePt": 11, "bold": false, "italic": false, "underline": false, "align": "left", "highlight": null },
-    { "id": "b3", "type": "image", "src": "https://editor-assets.mirabeltech.com/public/ads/42/images/img-abc123.jpg", "s3Key": "public/ads/42/images/img-abc123.jpg", "naturalWidth": 1200, "naturalHeight": 800 }
+    { "id": "b3", "type": "image", "src": "https://editor-assets.mirabeltech.com/public/tenants/acme/ads/42/images/img-abc123.jpg", "s3Key": "public/tenants/acme/ads/42/images/img-abc123.jpg", "naturalWidth": 1200, "naturalHeight": 800 }
   ],
   "stats": {
     "wordCount": 12,
@@ -705,12 +717,13 @@ Content-Type: application/json
 ### 10.5 Editor → S3 (via CloudFront): Load existing ad
 
 ```http
-GET https://editor-assets.mirabeltech.com/public/ads/42/ad.json
+GET https://editor-assets.mirabeltech.com/public/tenants/acme/ads/42/ad.json
 ```
 
 - Served via CloudFront with OAC → S3.
-- Public (no auth). Security model: `adId` values are treated as unguessable.
+- Public (no auth). Security model: the **composite path** `tenants/{tenantId}/ads/{adId}/...` is treated as unguessable. `tenantId` itself is a human-readable slug (guessable); the unguessable `adId` carries the path-secrecy. Anyone in possession of the full URL can read the object — same trust model as v1 single-tenant, just extended to include the tenant segment.
 - `404` response → editor renders blank canvas.
+- An `adId` that exists for tenant A returns **404 for tenant B** because the path differs; this is the read-side tenant boundary.
 
 ---
 
@@ -814,7 +827,7 @@ Two modes:
 **Deliverables**
 - ✅ Vite + React + TS + Tailwind scaffold, git initialized, pushed to `i83992473/classifieds-02`
 - ✅ Block data model (`Block`, `AdDoc`, `AdStats`, `AdWarning` types)
-- ✅ Querystring parser with default-width fallback
+- ✅ Querystring parser with default-width fallback. Required-param validation: missing `tenantId` / `adId` / `token` / `callbackUrl` → render a hard error page rather than mounting the edit surface (see §16)
 - ✅ `AdCanvas` with horizontal + vertical inch rulers
 - ✅ `TextBlockView` with autoresizing textarea
 - ✅ `ImageBlockView` (100% width, aspect-ratio)
@@ -854,10 +867,10 @@ Two modes:
 - ✅ `lib/pdf.ts` — html2canvas + jsPDF pipeline with fonts.ready await
 - ✅ `lib/thumbnail.ts` — 300px JPEG from same canvas
 - ✅ `lib/s3.ts` — signed-URL PUT helper
-- ✅ `lib/api.ts` — `/sign-upload` + `callbackUrl` POSTs with Bearer token
-- ✅ Save orchestration in `App.tsx` (Ctrl+S → compute → request URLs → PUT → POST)
-- ✅ Load-from-S3 on mount: `GET ad.json`, restore state
-- ✅ Image drop now uploads to S3 via signed URL (replacing local blob URL)
+- ✅ `lib/api.ts` — `/sign-upload` + `callbackUrl` POSTs with Bearer token. Request body sends `files[].name` (server builds full key from JWT-claim `tenantId` — client never specifies prefix; see §16)
+- ✅ Save orchestration in `App.tsx` (Ctrl+S → compute → request URLs → PUT → POST). Callback payload includes `tenantId` echo
+- ✅ Load-from-S3 on mount: `GET https://editor-assets.mirabeltech.com/public/tenants/{tenantId}/ads/{adId}/ad.json`, restore state
+- ✅ Image drop now uploads to S3 via signed URL (replacing local blob URL); persisted block `src` URLs include the tenant segment
 - ✅ Stub main-app endpoints (local mock) so end-to-end works against a fake
 - ✅ Layer-1 tests for `lib/pdf.ts` page-size math and `lib/s3.ts` URL-signing request shape; fetch stubbed for `lib/api.ts` happy-path + error cases
 
@@ -969,6 +982,103 @@ When selectable/searchable text or server-side re-rendering is required, introdu
 ### Repository
 - GitHub: https://github.com/i83992473/classifieds-02.git
 - Branch model: `main` (trunk-based, direct commits in v1)
+
+---
+
+## 16. Multi-tenancy
+
+The editor is multi-tenant from v1. Multiple distinct client organizations (publishers, magazines, directories — collectively "tenants") use the same deployed bundle, but their ads, images, users, and configuration are completely isolated from each other. This section is the source of truth for how that isolation is achieved; every other section that references tenants links back here.
+
+### 16.1 Model summary
+
+| Concern | Decision |
+|---|---|
+| Domain model | **Shared origin** — all tenants use `editor.mirabeltech.com`. No per-tenant subdomains in v1 (would require new SAN per tenant; wildcard cert is single-level only). |
+| Storage isolation | **Single bucket, prefix-per-tenant**. All keys live under `public/tenants/{tenantId}/ads/{adId}/...` in `classifieds-ad-assets`. |
+| Identity authority | **JWT claim** — the Bearer token issued by the main app carries a verified `tenantId` claim. The main app trusts only the claim; querystring `tenantId` is for display/path-building only. |
+| Editor's view of identity | The editor treats the token as **opaque** (does not parse the JWT). It echoes `tenantId` from the querystring into log/header UI; the main app re-validates against the claim on every API call. |
+| Branding / whitelabel | **Out of scope for v1.** Neutral chrome for all tenants; only `tenantName` is shown in the header. v2 introduces per-tenant branding alongside a tenant-config delivery channel. |
+| Per-tenant runtime config | **None in v1** beyond what's already in the launch URL. `/public/config.json` stays global. |
+| `adId` namespace | **Per-tenant unique** — `(tenantId, adId)` is the composite key. Tenant A's ad #42 and tenant B's ad #42 are distinct objects at distinct paths. |
+| Read access control | **CloudFront public reads**, same as single-tenant v1 — extended to include the tenant segment in the path. The unguessable `adId` carries the path-secrecy; `tenantId` is a guessable slug. |
+
+### 16.2 `tenantId` format and constraints
+
+- **Format:** human-readable slug, lowercase alphanumeric + hyphens, e.g., `acme`, `bigpub`, `north-shore-news`. Regex: `^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$` (1–32 chars).
+- **Uniqueness:** enforced by the main app (its tenant table is the source of truth). The editor and S3 take this for granted.
+- **Stability:** tenants do not rename in v1. If a tenant ever renames, the migration is `aws s3 cp --recursive` from old prefix to new and a parallel main-app DB update — out of scope here.
+- **Guessability:** **guessable by design.** The slug is treated as public information (similar to a customer subdomain in any SaaS). The cryptographic boundary is the JWT claim, not the slug.
+
+### 16.3 S3 key shape (canonical)
+
+```
+public/tenants/{tenantId}/ads/{adId}/ad.json
+public/tenants/{tenantId}/ads/{adId}/pdf.pdf
+public/tenants/{tenantId}/ads/{adId}/thumbnail.jpg
+public/tenants/{tenantId}/ads/{adId}/images/{imageId}.jpg
+```
+
+- The `public/` prefix is preserved from v1 single-tenant so that future `private/` siblings remain a clean option.
+- The tenant segment immediately follows `public/` so prefix-listing for `aws s3 rm --recursive s3://classifieds-ad-assets/public/tenants/{tenantId}/` is the full GDPR / "delete tenant X" answer.
+- No code in the editor or main app should hard-code an example `tenantId` outside of test fixtures and docs.
+
+### 16.4 The load-bearing rule: server-built keys
+
+> **The client never specifies an S3 key prefix. The main app builds every full key server-side from the verified `tenantId` claim in the Bearer token.**
+
+Every cross-tenant data leak in real-world multi-tenant SaaS systems traces back to violating this rule. Concretely, in the `/sign-upload` request (§10.2):
+- Editor sends only `{ name, contentType, contentLength }` per file. `name` is a logical filename like `pdf.pdf` or `images/img-abc123.jpg` — **never a full key, never including a tenant segment**.
+- Main app extracts `tenantId` from the verified JWT claim, validates `(tenantId, adId)` ownership, then constructs `public/tenants/{tenantId}/ads/{adId}/{name}` and signs that.
+- Main app rejects any `name` containing `..`, leading `/`, or path-traversal segments (defense in depth).
+
+Buggy "validate the prefix the client sent" logic is the canonical failure mode and must not exist in v1.
+
+### 16.5 `callbackUrl` host validation
+
+The launch querystring carries `callbackUrl`, which the editor POSTs to on save (§10.4). Without validation, a tenant-A token combined with a tenant-B `callbackUrl` would let an attacker exfiltrate ad metadata + stats to a tenant they don't own.
+
+- Each tenant maintains a registered set of allowed callback hosts in the main app (e.g., `main.acmeclassifieds.com`, `staging.acmeclassifieds.com`).
+- At `/sign-upload` time, the main app validates `URL(callbackUrl).host` is on the allowlist for the JWT-claim `tenantId`. If not, return `403`.
+- The editor itself does not need to validate `callbackUrl` — main app rejection at `/sign-upload` is the chokepoint.
+
+### 16.6 Editor responsibilities (multi-tenant)
+
+The editor's contribution to tenant isolation is small and clearly bounded — the main app does the security-critical work.
+
+1. **Validate the launch URL on mount.** Missing `tenantId`, `tenantName`, `adId`, `token`, or `callbackUrl` → render a hard error page; do not mount the edit surface. Display: "This editor was opened with missing or invalid launch parameters. Please return to the main app and try again."
+2. **Build read URLs with the tenant segment.** `GET .../public/tenants/{tenantId}/ads/{adId}/ad.json` on load. The querystring `tenantId` is used here; it's safe because the URL is read-only and a wrong slug just yields 404.
+3. **Send only `name` (not `key`) to `/sign-upload`.** Never construct full S3 keys client-side — that's the main app's job.
+4. **Display `tenantName` in the header.** Display-only; never used for routing or storage.
+5. **Forward the Bearer token unchanged on every API call.** The editor does not parse the JWT.
+
+### 16.7 Main-app team contract additions
+
+Items the main-app team must build/change on top of the §10.2 spec to make multi-tenancy work. Surface this list in the kickoff for that work stream:
+
+- **JWT must carry verified `tenantId` claim.** Claim name: `tenantId` (camelCase, matching the querystring param). Issued during the main app's own auth flow; cannot be supplied by the client.
+- **`/sign-upload` reads `tenantId` from the claim, never from the request.** Implementation pattern: `tenantId = jwt.verify(token).tenantId`. Any client-supplied tenant value is ignored.
+- **`/sign-upload` constructs full keys server-side** (§16.4).
+- **`/sign-upload` rejects path-traversal in `file.name`** (`..`, leading `/`, etc.).
+- **`/sign-upload` validates `callbackUrl.host` against per-tenant allowlist** (§16.5).
+- **Echo `tenantId` in the callback payload** (§10.4) for routing and debug.
+- **Per-tenant callback-host registry** in the main app's data model — the source of truth for §16.5.
+- **(Recommended, not strictly required)** IAM permission boundary on the signing role scoped to the tenant prefix at request time, so a bug in the prefix builder cannot sign URLs into another tenant's prefix. ABAC with session tags from JWT claims is the AWS-native pattern; v1 may ship without it if `/sign-upload` is well-tested.
+
+### 16.8 Operational notes
+
+- **Tenant onboarding** (single-bucket prefix model): zero infra work. A new tenant is "onboarded" the moment the main app starts issuing tokens with a new `tenantId` claim. No bucket, CloudFront, DNS, or cert changes are needed.
+- **Tenant offboarding / GDPR delete:** `aws s3 rm --recursive s3://classifieds-ad-assets/public/tenants/{tenantId}/ --profile classifieds-admin`, plus the corresponding rows in the main-app DB (out of scope for the editor).
+- **Per-tenant cost attribution:** not natively available in this model (S3 bills by bucket, not prefix). Use S3 Storage Lens with prefix grouping, or S3 Inventory + Athena on the standard log bucket. Defer until tenants ask for chargeback. Tag all AWS resources `app=classifieds-02` from day one so a future re-architecture has a clear scope.
+- **CloudWatch / observability:** any future log lines, metrics, or traces that include a key path will naturally include `tenantId` because it's in the path. No additional dimensioning needed.
+
+### 16.9 Out of scope for v1 (revisit in v2)
+
+- Per-tenant branding (logo, primary color, custom font set, tenant CSS).
+- Per-tenant subdomain (`acme.editor.mirabeltech.com`) — would require SAN per tenant or a non-wildcard cert.
+- Per-tenant config endpoint (the channel that delivers branding when v2 lands).
+- Bucket-per-tenant or account-per-tenant isolation. Migration path from prefix-per-tenant is `aws s3 cp --recursive` per tenant + a config flip; cheap if needed but not pre-built.
+- Cryptographic per-tenant read access (signed CloudFront cookies or `/sign-download` endpoint). The path-secrecy model is sufficient for v1.
+- Per-tenant cost-attribution tags. Single bucket = single line item; revisit when tenants ask.
 
 ---
 
